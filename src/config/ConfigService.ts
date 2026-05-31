@@ -54,6 +54,10 @@ export class ConfigService {
         return { ...this.config };
     }
 
+    public isConfigured(): boolean {
+        return !!(this.config.host && this.config.username);
+    }
+
     public validate(): string[] {
         const errors: string[] = [];
         if (!this.config.host) {
@@ -68,12 +72,25 @@ export class ConfigService {
         return errors;
     }
 
+    /**
+     * Persist a key/value pair into workspace settings (or global if no workspace).
+     */
+    public async saveSetting(
+        key: string,
+        value: unknown
+    ): Promise<void> {
+        const cfg = vscode.workspace.getConfiguration('smartFtp');
+        const target = vscode.workspace.workspaceFolders
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global;
+        await cfg.update(key, value, target);
+    }
+
     private normalizeRemotePath(path: string): string {
         const trimmed = path.trim();
         if (!trimmed || trimmed === '') {
             return '/';
         }
-        // Ensure it starts with a forward slash
         return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
     }
 }

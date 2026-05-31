@@ -1,71 +1,89 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { FtpClient } from './FtpClient';
+import { ConnectionPool } from './ConnectionPool';
+import { isPermanentFtpError } from './FtpClient';
 import { ConfigService } from '../config/ConfigService';
 import { Logger } from '../utils/Logger';
-import {
-    localToRemotePath,
-    remoteDir,
-    isExcluded,
-} from '../utils/PathUtils';
+import { localToRemotePath, remoteDir, isExcluded } from '../utils/PathUtils';
 
-/**
- * Manages all upload operations:
- *  - Upload a single file (with retry and progress)
- *  - Upload an entire workspace folder recursively
- */
+// Always excluded, regardless of user config
+const HARD_EXCLUDED = ['.git', '.vscode', 'node_modules'];
+
 export class UploadManager {
+    private readonly pool: ConnectionPool;
     private readonly configService: ConfigService;
     private readonly logger: Logger;
 
-    constructor(configService: ConfigService, logger: Logger) {
+    /** Debounce map: fsPath → pending timer */
+    private readonly debounceMap = new Map<string, NodeJS.Timeout>();
+    private static readonly DEBOUNCE_MS = 1500;
+
+    constructor(pool: ConnectionPool, configService: ConfigService, logger: Logger) {
+        this.pool = pool;
         this.configService = configService;
         this.logger = logger;
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // Public API
-    // ────────────────────────────────────────────────────────────────────────
+    // ── Public API ────────────────────────────────────────────────────────
 
     /**
-     * Upload a single file to the FTP server.
-     * Shows a progress notification and a success/error toast.
+     * Debounced upload — coalesces rapid saves of the same file into one
+     * upload. Used by the auto-save listener.
+     */
+    public scheduleUpload(fileUri: vscode.Uri): void {
+        const key = fileUri.fsPath;
+        const existing = this.debounceMap.get(key);
+        if (existing) { clearTimeout(existing); }
+
+        const timer = setTimeout(() => {
+            this.debounceMap.delete(key);
+            this.uploadFile(fileUri).catch(() => { /* handled inside */ });
+        }, UploadManager.DEBOUNCE_MS);
+
+        this.debounceMap.set(key, timer);
+    }
+
+    /**
+     * Upload a single file. Reuses the pool connection — no fresh TCP
+     * handshake unless the connection was dropped.
      */
     public async uploadFile(fileUri: vscode.Uri): Promise<void> {
         const config = this.configService.getConfig();
 
-        const validationErrors = this.configService.validate();
-        if (validationErrors.length > 0) {
-            const msg = `Smart FTP not configured: ${validationErrors.join(' ')}`;
-            this.logger.warn(msg);
-            vscode.window.showErrorMessage(`Smart FTP: ${validationErrors[0]}`);
+        if (this.configService.validate().length > 0) {
+            this.logger.debug('Upload skipped — not configured.');
             return;
         }
 
         const workspaceFolder = vscode.workspace.getWorkspaceFolder(fileUri);
         if (!workspaceFolder) {
-            this.logger.warn(`File is outside the workspace: ${fileUri.fsPath}`);
-            vscode.window.showWarningMessage(
-                'Smart FTP: File is outside the current workspace and cannot be uploaded.'
-            );
+            this.logger.debug(`File outside workspace, skipping: ${fileUri.fsPath}`);
             return;
         }
 
         const localPath = fileUri.fsPath;
         const fileName = path.basename(localPath);
-        const remotePath = localToRemotePath(
-            fileUri,
-            workspaceFolder.uri,
-            config.remotePath
-        );
+        const relPath = path.relative(workspaceFolder.uri.fsPath, localPath).replace(/\\/g, '/');
+        const topDir = relPath.split('/')[0];
+
+        // Hard-exclude system folders
+        if (HARD_EXCLUDED.includes(topDir)) {
+            this.logger.debug(`Hard-excluded: ${relPath}`);
+            return;
+        }
+        // User-configured exclude patterns
+        if (isExcluded(fileName, config.exclude) || isExcluded(relPath, config.exclude)) {
+            this.logger.debug(`Excluded: ${relPath}`);
+            return;
+        }
+
+        const remotePath = localToRemotePath(fileUri, workspaceFolder.uri, config.remotePath);
         const remoteDirectory = remoteDir(remotePath);
 
         this.logger.separator();
         this.logger.info(`Uploading: ${localPath}`);
         this.logger.info(`      → ${remotePath}`);
-
-        const client = new FtpClient(this.configService, this.logger);
 
         await vscode.window.withProgress(
             {
@@ -76,55 +94,65 @@ export class UploadManager {
             async (progress) => {
                 progress.report({ increment: 0, message: 'Connecting…' });
 
-                try {
-                    await client.withRetry(async () => {
-                        await client.connect();
+                const maxAttempts = config.retryCount + 1;
 
-                        progress.report({ increment: 20, message: 'Creating remote directory…' });
-                        await client.ensureDir(remoteDirectory);
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        const client = await this.pool.acquire();
 
-                        progress.report({ increment: 30, message: 'Uploading file…' });
+                        progress.report({ increment: 20, message: 'Uploading…' });
 
-                        // Set up a transfer progress tracker
                         const stat = fs.statSync(localPath);
                         client.trackProgress((info) => {
                             if (stat.size > 0) {
-                                const pct = Math.round((info.bytes / stat.size) * 50);
-                                progress.report({ increment: pct, message: `${info.bytes} / ${stat.size} bytes` });
+                                const pct = Math.min(80, Math.round((info.bytes / stat.size) * 80));
+                                progress.report({ increment: pct, message: `${formatBytes(info.bytes)} / ${formatBytes(stat.size)}` });
                             }
                         });
 
+                        await client.ensureDir(remoteDirectory);
                         await client.uploadFile(localPath, remotePath);
-
                         client.trackProgress(); // stop tracking
-                        await client.disconnect();
-                    }, `Upload ${fileName}`);
 
-                    progress.report({ increment: 100, message: 'Done!' });
-                    this.logger.info(`✓ Upload successful: ${fileName}`);
-                    vscode.window.showInformationMessage(
-                        `Smart FTP: ✓ Uploaded ${fileName}`
-                    );
-                } catch (err: unknown) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    this.logger.error(`Upload failed for ${fileName}: ${msg}`, err);
-                    vscode.window.showErrorMessage(
-                        `Smart FTP: Upload failed for "${fileName}": ${msg}`
-                    );
-                    await client.disconnect();
+                        progress.report({ increment: 100, message: 'Done!' });
+                        this.logger.info(`✓ Upload successful: ${fileName}`);
+                        vscode.window.showInformationMessage(`Smart FTP: ✓ Uploaded ${fileName}`);
+                        return; // success
+
+                    } catch (err: unknown) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        this.logger.warn(`Upload attempt ${attempt}/${maxAttempts} failed: ${msg}`);
+
+                        // Permanent errors — no point retrying
+                        if (isPermanentFtpError(msg)) {
+                            this.logger.error(`Upload failed (permanent error): ${msg}`, err);
+                            vscode.window.showErrorMessage(`Smart FTP: Upload failed — ${msg}`);
+                            this.pool.invalidate();
+                            return;
+                        }
+
+                        // Invalidate pool so next acquire reconnects
+                        this.pool.invalidate();
+
+                        if (attempt < maxAttempts) {
+                            this.logger.info(`Retrying in ${config.retryDelay}ms…`);
+                            await sleep(config.retryDelay);
+                        } else {
+                            this.logger.error(`Upload failed after ${maxAttempts} attempt(s): ${msg}`, err);
+                            vscode.window.showErrorMessage(`Smart FTP: Upload failed for "${fileName}": ${msg}`);
+                        }
+                    }
                 }
             }
         );
     }
 
     /**
-     * Recursively upload an entire workspace folder to the FTP server.
-     * Shows an overall progress notification with file counts.
+     * Recursively upload the entire workspace using the pool connection.
      */
     public async uploadWorkspace(workspaceUri: vscode.Uri): Promise<void> {
-        const validationErrors = this.configService.validate();
-        if (validationErrors.length > 0) {
-            vscode.window.showErrorMessage(`Smart FTP: ${validationErrors[0]}`);
+        if (this.configService.validate().length > 0) {
+            vscode.window.showErrorMessage('Smart FTP: Not configured.');
             return;
         }
 
@@ -132,19 +160,14 @@ export class UploadManager {
         const workspacePath = workspaceUri.fsPath;
 
         this.logger.separator();
-        this.logger.info(`Starting workspace upload from: ${workspacePath}`);
-        this.logger.info(`Remote base: ${config.remotePath}`);
+        this.logger.info(`Workspace upload: ${workspacePath} → ${config.remotePath}`);
 
-        // Collect all files to upload
         const files = this.collectFiles(workspacePath, config.exclude);
         if (files.length === 0) {
             vscode.window.showInformationMessage('Smart FTP: No files found to upload.');
             return;
         }
-
-        this.logger.info(`Found ${files.length} file(s) to upload.`);
-
-        const client = new FtpClient(this.configService, this.logger);
+        this.logger.info(`Found ${files.length} file(s).`);
 
         await vscode.window.withProgress(
             {
@@ -153,30 +176,25 @@ export class UploadManager {
                 cancellable: false,
             },
             async (progress) => {
-                progress.report({ increment: 0, message: `0 / ${files.length} files` });
+                let uploaded = 0;
+                let failed = 0;
 
                 try {
-                    await client.connect();
-
-                    let uploaded = 0;
-                    let failed = 0;
+                    // Acquire once — reuse for all files
+                    const client = await this.pool.acquire();
 
                     for (const localFilePath of files) {
                         const fileUri = vscode.Uri.file(localFilePath);
-                        const remotePath = localToRemotePath(
-                            fileUri,
-                            workspaceUri,
-                            config.remotePath
-                        );
-                        const remoteDirectory = remoteDir(remotePath);
+                        const remotePath = localToRemotePath(fileUri, workspaceUri, config.remotePath);
                         const fileName = path.basename(localFilePath);
 
                         progress.report({
-                            message: `${uploaded + 1} / ${files.length}: ${fileName}`,
+                            message: `${uploaded + failed + 1}/${files.length}: ${fileName}`,
+                            increment: Math.round(100 / files.length),
                         });
 
                         try {
-                            await client.ensureDir(remoteDirectory);
+                            await client.ensureDir(remoteDir(remotePath));
                             await client.uploadFile(localFilePath, remotePath);
                             uploaded++;
                             this.logger.info(`✓ ${remotePath}`);
@@ -185,52 +203,37 @@ export class UploadManager {
                             const msg = err instanceof Error ? err.message : String(err);
                             this.logger.error(`✗ ${remotePath}: ${msg}`);
 
-                            // If the connection dropped, try to reconnect for the remaining files
-                            if (client.isConnected === false) {
-                                this.logger.info('Connection lost — attempting to reconnect…');
+                            if (!client.isConnected) {
+                                this.pool.invalidate();
                                 try {
-                                    await client.connect();
+                                    await this.pool.acquire();
                                 } catch {
-                                    this.logger.error('Reconnection failed. Aborting workspace upload.');
+                                    this.logger.error('Reconnection failed — aborting workspace upload.');
                                     break;
                                 }
                             }
                         }
-
-                        const pct = Math.round(((uploaded + failed) / files.length) * 100);
-                        progress.report({ increment: pct });
-                    }
-
-                    await client.disconnect();
-
-                    const summary = `Workspace upload complete: ${uploaded} succeeded, ${failed} failed.`;
-                    this.logger.info(summary);
-
-                    if (failed === 0) {
-                        vscode.window.showInformationMessage(`Smart FTP: ✓ ${summary}`);
-                    } else {
-                        vscode.window.showWarningMessage(`Smart FTP: ⚠ ${summary} Check Output for details.`);
                     }
                 } catch (err: unknown) {
                     const msg = err instanceof Error ? err.message : String(err);
                     this.logger.error(`Workspace upload aborted: ${msg}`, err);
-                    vscode.window.showErrorMessage(
-                        `Smart FTP: Workspace upload failed — ${msg}`
-                    );
-                    await client.disconnect();
+                    vscode.window.showErrorMessage(`Smart FTP: Workspace upload failed — ${msg}`);
+                    return;
+                }
+
+                const summary = `${uploaded} uploaded, ${failed} failed.`;
+                this.logger.info(`Workspace upload complete: ${summary}`);
+                if (failed === 0) {
+                    vscode.window.showInformationMessage(`Smart FTP: ✓ Workspace upload complete — ${summary}`);
+                } else {
+                    vscode.window.showWarningMessage(`Smart FTP: ⚠ Workspace upload done — ${summary} Check Output for details.`);
                 }
             }
         );
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // Private helpers
-    // ────────────────────────────────────────────────────────────────────────
+    // ── Private helpers ───────────────────────────────────────────────────
 
-    /**
-     * Recursively collect all file paths under `dir`, respecting exclusion
-     * patterns. Returns absolute paths.
-     */
     private collectFiles(dir: string, excludePatterns: string[]): string[] {
         const results: string[] = [];
         this.walkDir(dir, dir, excludePatterns, results);
@@ -246,21 +249,17 @@ export class UploadManager {
         let entries: fs.Dirent[];
         try {
             entries = fs.readdirSync(currentDir, { withFileTypes: true });
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.logger.warn(`Cannot read directory ${currentDir}: ${msg}`);
+        } catch {
             return;
         }
 
         for (const entry of entries) {
             const entryPath = path.join(currentDir, entry.name);
-            const relativePath = path.relative(rootDir, entryPath).replace(/\\/g, '/');
+            const relPath = path.relative(rootDir, entryPath).replace(/\\/g, '/');
+            const topDir = relPath.split('/')[0];
 
-            // Check against exclusion patterns using both the name and relative path
-            if (isExcluded(entry.name, excludePatterns) || isExcluded(relativePath, excludePatterns)) {
-                this.logger.debug(`Excluded: ${relativePath}`);
-                continue;
-            }
+            if (HARD_EXCLUDED.includes(topDir)) { continue; }
+            if (isExcluded(entry.name, excludePatterns) || isExcluded(relPath, excludePatterns)) { continue; }
 
             if (entry.isDirectory()) {
                 this.walkDir(rootDir, entryPath, excludePatterns, results);
@@ -269,4 +268,14 @@ export class UploadManager {
             }
         }
     }
+}
+
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) { return `${bytes} B`; }
+    if (bytes < 1024 * 1024) { return `${(bytes / 1024).toFixed(1)} KB`; }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as ftp from 'basic-ftp';
-import { FtpClient, FtpFileInfo } from './FtpClient';
+import { ConnectionPool } from './ConnectionPool';
+import { FtpFileInfo } from './FtpClient';
 import { ConfigService } from '../config/ConfigService';
 import { Logger } from '../utils/Logger';
 import {
@@ -20,36 +21,29 @@ interface SyncStats {
     failed: number;
 }
 
-/**
- * Compares local workspace files against the remote FTP directory and
- * synchronises them: newer local files are uploaded, remote-only files are
- * downloaded to local. Files that match by timestamp are skipped.
- */
 export class SyncManager {
+    private readonly pool: ConnectionPool;
     private readonly configService: ConfigService;
     private readonly logger: Logger;
 
-    constructor(configService: ConfigService, logger: Logger) {
+    constructor(pool: ConnectionPool, configService: ConfigService, logger: Logger) {
+        this.pool = pool;
         this.configService = configService;
         this.logger = logger;
     }
 
     public async syncWorkspace(workspaceUri: vscode.Uri): Promise<void> {
-        const validationErrors = this.configService.validate();
-        if (validationErrors.length > 0) {
-            vscode.window.showErrorMessage(`Smart FTP: ${validationErrors[0]}`);
+        if (this.configService.validate().length > 0) {
+            vscode.window.showErrorMessage('Smart FTP: Not configured.');
             return;
         }
 
         const config = this.configService.getConfig();
         const workspacePath = workspaceUri.fsPath;
+        const stats: SyncStats = { uploaded: 0, downloaded: 0, skipped: 0, failed: 0 };
 
         this.logger.separator();
-        this.logger.info('Starting workspace sync…');
-        this.logger.info(`Local:  ${workspacePath}`);
-        this.logger.info(`Remote: ${config.remotePath}`);
-
-        const stats: SyncStats = { uploaded: 0, downloaded: 0, skipped: 0, failed: 0 };
+        this.logger.info(`Sync: ${workspacePath} ↔ ${config.remotePath}`);
 
         await vscode.window.withProgress(
             {
@@ -58,188 +52,152 @@ export class SyncManager {
                 cancellable: false,
             },
             async (progress) => {
-                progress.report({ increment: 0, message: 'Connecting…' });
-
-                const client = new FtpClient(this.configService, this.logger);
-
                 try {
-                    await client.connect();
+                    const client = await this.pool.acquire();
 
-                    progress.report({ increment: 10, message: 'Scanning remote…' });
-
-                    // Build a map of all remote files: remotePath → FtpFileInfo
+                    progress.report({ increment: 5, message: 'Scanning remote…' });
                     const remoteFiles = new Map<string, FtpFileInfo>();
                     await this.scanRemoteDir(client, config.remotePath, remoteFiles);
-                    this.logger.info(`Remote files found: ${remoteFiles.size}`);
+                    this.logger.info(`Remote files: ${remoteFiles.size}`);
 
-                    progress.report({ increment: 10, message: 'Scanning local…' });
-
-                    // Build a map of all local files: remotePath → localAbsPath
-                    const localFiles = new Map<string, string>();
-                    this.scanLocalDir(
-                        workspacePath,
-                        workspacePath,
-                        workspaceUri,
-                        config.remotePath,
-                        config.exclude,
-                        localFiles
-                    );
-                    this.logger.info(`Local files found:  ${localFiles.size}`);
+                    progress.report({ increment: 5, message: 'Scanning local…' });
+                    const localFiles = new Map<string, string>(); // remotePath → localAbsPath
+                    this.scanLocalDir(workspacePath, workspaceUri, config.remotePath, config.exclude, localFiles);
+                    this.logger.info(`Local files:  ${localFiles.size}`);
 
                     const total = localFiles.size + remoteFiles.size;
                     let processed = 0;
 
-                    // ── Upload local files that are newer than the remote ──
+                    // ── Upload local → remote ──────────────────────────────
                     for (const [remotePath, localAbsPath] of localFiles) {
                         processed++;
-                        const fileName = path.basename(localAbsPath);
                         progress.report({
-                            message: `Syncing ${fileName}… (${processed}/${total})`,
+                            message: `${processed}/${total}: ${path.basename(localAbsPath)}`,
+                            increment: Math.round(85 / Math.max(total, 1)),
                         });
 
                         const remoteInfo = remoteFiles.get(remotePath);
 
                         if (!remoteInfo) {
-                            // File does not exist remotely — upload it
+                            // Remote doesn't have it → upload
                             try {
-                                const remoteDirectory = remoteDir(remotePath);
-                                await client.ensureDir(remoteDirectory);
+                                await client.ensureDir(remoteDir(remotePath));
                                 await client.uploadFile(localAbsPath, remotePath);
                                 stats.uploaded++;
-                                this.logger.info(`↑ Uploaded (new):    ${remotePath}`);
+                                this.logger.info(`↑ New:    ${remotePath}`);
                             } catch (err: unknown) {
                                 stats.failed++;
-                                const msg = err instanceof Error ? err.message : String(err);
-                                this.logger.error(`↑ Upload failed:     ${remotePath}: ${msg}`);
+                                this.logger.error(`↑ Failed: ${remotePath}: ${(err as Error).message}`);
                             }
                         } else {
-                            // Compare modification times
-                            const localStat = fs.statSync(localAbsPath);
-                            const localMtime = localStat.mtimeMs;
+                            const localMtime = fs.statSync(localAbsPath).mtimeMs;
                             const remoteMtime = remoteInfo.modifiedAt?.getTime() ?? 0;
 
                             if (localMtime > remoteMtime + 2000) {
-                                // Local is newer — upload
                                 try {
-                                    const remoteDirectory = remoteDir(remotePath);
-                                    await client.ensureDir(remoteDirectory);
+                                    await client.ensureDir(remoteDir(remotePath));
                                     await client.uploadFile(localAbsPath, remotePath);
                                     stats.uploaded++;
-                                    this.logger.info(`↑ Uploaded (newer):  ${remotePath}`);
+                                    this.logger.info(`↑ Newer: ${remotePath}`);
                                 } catch (err: unknown) {
                                     stats.failed++;
-                                    const msg = err instanceof Error ? err.message : String(err);
-                                    this.logger.error(`↑ Upload failed:     ${remotePath}: ${msg}`);
+                                    this.logger.error(`↑ Failed: ${remotePath}: ${(err as Error).message}`);
                                 }
                             } else {
                                 stats.skipped++;
-                                this.logger.debug(`= Skipped (in sync): ${remotePath}`);
+                                this.logger.debug(`= In sync: ${remotePath}`);
                             }
 
-                            // Mark as processed so we don't download it again
-                            remoteFiles.delete(remotePath);
+                            remoteFiles.delete(remotePath); // mark as processed
                         }
                     }
 
-                    // ── Download remote-only files ──
+                    // ── Download remote-only files ──────────────────────────
                     for (const [remotePath, remoteInfo] of remoteFiles) {
                         processed++;
-                        progress.report({
-                            message: `Downloading ${remoteInfo.name}… (${processed}/${total})`,
-                        });
+                        progress.report({ message: `↓ ${remoteInfo.name}` });
 
-                        const localAbsPath = remoteToLocalPath(
-                            remotePath,
-                            config.remotePath,
-                            workspaceUri
-                        );
-                        const localDir = path.dirname(localAbsPath);
+                        const localAbsPath = remoteToLocalPath(remotePath, config.remotePath, workspaceUri);
+                        const localDirectory = path.dirname(localAbsPath);
+                        const tempPath = `${localAbsPath}.smartftp_tmp`;
 
                         try {
-                            if (!fs.existsSync(localDir)) {
-                                fs.mkdirSync(localDir, { recursive: true });
+                            if (!fs.existsSync(localDirectory)) {
+                                fs.mkdirSync(localDirectory, { recursive: true });
                             }
-                            const tempPath = `${localAbsPath}.smartftp_tmp`;
                             await client.downloadFile(remotePath, tempPath);
                             fs.renameSync(tempPath, localAbsPath);
                             stats.downloaded++;
-                            this.logger.info(`↓ Downloaded (remote-only): ${remotePath}`);
+                            this.logger.info(`↓ Remote-only: ${remotePath}`);
                         } catch (err: unknown) {
+                            if (fs.existsSync(tempPath)) { fs.unlinkSync(tempPath); }
                             stats.failed++;
-                            const msg = err instanceof Error ? err.message : String(err);
-                            this.logger.error(`↓ Download failed:    ${remotePath}: ${msg}`);
+                            this.logger.error(`↓ Failed: ${remotePath}: ${(err as Error).message}`);
                         }
                     }
 
-                    await client.disconnect();
-
-                    const summary =
-                        `Sync complete — ↑ ${stats.uploaded} uploaded, ` +
-                        `↓ ${stats.downloaded} downloaded, ` +
-                        `= ${stats.skipped} skipped, ` +
-                        `✗ ${stats.failed} failed.`;
-
-                    this.logger.info(summary);
+                    const summary = `↑ ${stats.uploaded} uploaded, ↓ ${stats.downloaded} downloaded, = ${stats.skipped} in sync, ✗ ${stats.failed} failed.`;
+                    this.logger.info(`Sync complete — ${summary}`);
                     progress.report({ increment: 100, message: 'Complete!' });
 
                     if (stats.failed === 0) {
-                        vscode.window.showInformationMessage(`Smart FTP: ✓ ${summary}`);
+                        vscode.window.showInformationMessage(`Smart FTP: ✓ Sync complete — ${summary}`);
                     } else {
-                        vscode.window.showWarningMessage(`Smart FTP: ⚠ ${summary}`);
+                        vscode.window.showWarningMessage(`Smart FTP: ⚠ Sync done — ${summary}`);
                     }
                 } catch (err: unknown) {
                     const msg = err instanceof Error ? err.message : String(err);
                     this.logger.error(`Sync failed: ${msg}`, err);
+                    this.pool.invalidate();
                     vscode.window.showErrorMessage(`Smart FTP: Sync failed — ${msg}`);
-                    await client.disconnect();
                 }
             }
         );
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // Private helpers
-    // ────────────────────────────────────────────────────────────────────────
+    // ── Private helpers ───────────────────────────────────────────────────
 
-    /**
-     * Recursively scan the remote directory and populate `remoteFiles`.
-     * Key: normalized remote path. Value: FtpFileInfo.
-     */
     private async scanRemoteDir(
-        client: FtpClient,
+        client: { list: (p: string) => Promise<FtpFileInfo[]> },
         remotePath: string,
-        remoteFiles: Map<string, FtpFileInfo>
+        out: Map<string, FtpFileInfo>
     ): Promise<void> {
         const normalized = normalizeRemotePath(remotePath);
         let entries: FtpFileInfo[];
         try {
             entries = await client.list(normalized);
         } catch {
-            this.logger.warn(`Could not list remote directory: ${normalized}`);
+            this.logger.warn(`Cannot list remote directory: ${normalized}`);
             return;
         }
 
         for (const entry of entries) {
             const entryPath = `${normalized === '/' ? '' : normalized}/${entry.name}`;
             if (entry.type === ftp.FileType.Directory) {
-                await this.scanRemoteDir(client, entryPath, remoteFiles);
+                await this.scanRemoteDir(client, entryPath, out);
             } else if (entry.type === ftp.FileType.File) {
-                remoteFiles.set(entryPath, entry);
+                out.set(entryPath, entry);
             }
         }
     }
 
-    /**
-     * Recursively scan the local workspace directory and populate `localFiles`.
-     * Key: corresponding remote path. Value: absolute local path.
-     */
     private scanLocalDir(
+        rootDir: string,
+        workspaceUri: vscode.Uri,
+        remotePath: string,
+        excludePatterns: string[],
+        out: Map<string, string>
+    ): void {
+        this.walkLocal(rootDir, rootDir, workspaceUri, remotePath, excludePatterns, out);
+    }
+
+    private walkLocal(
         rootDir: string,
         currentDir: string,
         workspaceUri: vscode.Uri,
         remotePath: string,
         excludePatterns: string[],
-        localFiles: Map<string, string>
+        out: Map<string, string>
     ): void {
         let entries: fs.Dirent[];
         try {
@@ -248,27 +206,21 @@ export class SyncManager {
             return;
         }
 
-        for (const entry of entries) {
-            const entryAbsPath = path.join(currentDir, entry.name);
-            const relative = path.relative(rootDir, entryAbsPath).replace(/\\/g, '/');
+        const HARD_EXCLUDED = ['.git', '.vscode', 'node_modules'];
 
-            if (isExcluded(entry.name, excludePatterns) || isExcluded(relative, excludePatterns)) {
-                continue;
-            }
+        for (const entry of entries) {
+            const absPath = path.join(currentDir, entry.name);
+            const relPath = path.relative(rootDir, absPath).replace(/\\/g, '/');
+            const topDir = relPath.split('/')[0];
+
+            if (HARD_EXCLUDED.includes(topDir)) { continue; }
+            if (isExcluded(entry.name, excludePatterns) || isExcluded(relPath, excludePatterns)) { continue; }
 
             if (entry.isDirectory()) {
-                this.scanLocalDir(
-                    rootDir,
-                    entryAbsPath,
-                    workspaceUri,
-                    remotePath,
-                    excludePatterns,
-                    localFiles
-                );
+                this.walkLocal(rootDir, absPath, workspaceUri, remotePath, excludePatterns, out);
             } else if (entry.isFile()) {
-                const fileUri = vscode.Uri.file(entryAbsPath);
-                const rPath = localToRemotePath(fileUri, workspaceUri, remotePath);
-                localFiles.set(rPath, entryAbsPath);
+                const rPath = localToRemotePath(vscode.Uri.file(absPath), workspaceUri, remotePath);
+                out.set(rPath, absPath);
             }
         }
     }

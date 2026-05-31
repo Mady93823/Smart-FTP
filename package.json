@@ -60,6 +60,18 @@
         "title": "Sync Workspace",
         "category": "Smart FTP",
         "icon": "$(sync)"
+      },
+      {
+        "command": "smartFtp.configure",
+        "title": "Configure",
+        "category": "Smart FTP",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "smartFtp.toggleAutoUpload",
+        "title": "Toggle Auto Upload on Save",
+        "category": "Smart FTP",
+        "icon": "$(cloud-upload)"
       }
     ],
     "configuration": {
@@ -122,7 +134,15 @@
         },
         "smartFtp.exclude": {
           "type": "array",
-          "default": [".git", "node_modules", ".vscode", "out", "dist", ".DS_Store", "Thumbs.db"],
+          "default": [
+            ".git",
+            "node_modules",
+            ".vscode",
+            "out",
+            "dist",
+            ".DS_Store",
+            "Thumbs.db"
+          ],
           "description": "Glob patterns for files/folders to exclude from upload"
         }
       }
@@ -132,6 +152,10 @@
         {
           "command": "smartFtp.uploadCurrentFile",
           "group": "smartFtp@1"
+        },
+        {
+          "command": "smartFtp.configure",
+          "group": "smartFtp@2"
         }
       ],
       "editor/title": [
@@ -139,13 +163,20 @@
           "command": "smartFtp.uploadCurrentFile",
           "group": "navigation"
         }
+      ],
+      "commandPalette": [
+        {
+          "command": "smartFtp.toggleAutoUpload",
+          "when": "true"
+        }
       ]
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run bundle",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap --watch",
     "pretest": "npm run compile",
     "lint": "eslint src --ext ts"
   },
@@ -154,6 +185,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.19.0",
     "@typescript-eslint/parser": "^6.19.0",
+    "esbuild": "^0.28.0",
     "eslint": "^8.56.0",
     "typescript": "^5.3.3"
   },
