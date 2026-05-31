@@ -1,0 +1,164 @@
+{
+  "name": "smart-ftp-deploy",
+  "displayName": "Smart FTP Deploy",
+  "description": "Modern FTP deployment extension with auto-upload, sync, and superior FTP server compatibility",
+  "version": "1.0.0",
+  "publisher": "smart-ftp-deploy",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mady93823/Smart-FTP"
+  },
+  "homepage": "https://github.com/Mady93823/Smart-FTP#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "ftp",
+    "deploy",
+    "upload",
+    "sync",
+    "ftps",
+    "sftp",
+    "remote"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "smartFtp.uploadCurrentFile",
+        "title": "Upload Current File",
+        "category": "Smart FTP",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "smartFtp.uploadWorkspace",
+        "title": "Upload Workspace",
+        "category": "Smart FTP",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "smartFtp.downloadCurrentFile",
+        "title": "Download Current File",
+        "category": "Smart FTP",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "smartFtp.testConnection",
+        "title": "Test Connection",
+        "category": "Smart FTP",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "smartFtp.syncWorkspace",
+        "title": "Sync Workspace",
+        "category": "Smart FTP",
+        "icon": "$(sync)"
+      }
+    ],
+    "configuration": {
+      "title": "Smart FTP Deploy",
+      "properties": {
+        "smartFtp.host": {
+          "type": "string",
+          "default": "",
+          "description": "FTP server hostname or IP address"
+        },
+        "smartFtp.port": {
+          "type": "number",
+          "default": 21,
+          "description": "FTP server port"
+        },
+        "smartFtp.username": {
+          "type": "string",
+          "default": "",
+          "description": "FTP username"
+        },
+        "smartFtp.password": {
+          "type": "string",
+          "default": "",
+          "description": "FTP password"
+        },
+        "smartFtp.secure": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use FTPS (FTP over TLS)"
+        },
+        "smartFtp.remotePath": {
+          "type": "string",
+          "default": "/",
+          "description": "Remote base path on the FTP server"
+        },
+        "smartFtp.autoUpload": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically upload files when saved"
+        },
+        "smartFtp.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose debug logging in the output channel"
+        },
+        "smartFtp.retryCount": {
+          "type": "number",
+          "default": 3,
+          "description": "Number of retry attempts for failed transfers"
+        },
+        "smartFtp.retryDelay": {
+          "type": "number",
+          "default": 2000,
+          "description": "Delay in milliseconds between retry attempts"
+        },
+        "smartFtp.connectionTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Connection timeout in milliseconds"
+        },
+        "smartFtp.exclude": {
+          "type": "array",
+          "default": [".git", "node_modules", ".vscode", "out", "dist", ".DS_Store", "Thumbs.db"],
+          "description": "Glob patterns for files/folders to exclude from upload"
+        }
+      }
+    },
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "smartFtp.uploadCurrentFile",
+          "group": "smartFtp@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "smartFtp.uploadCurrentFile",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "basic-ftp": "^5.0.5",
+    "minimatch": "^9.0.3"
+  }
+}
