@@ -53,88 +53,89 @@ export class SyncManager {
             },
             async (progress) => {
                 try {
-                    const client = await this.pool.acquire();
+                    // withClient holds the busy-lock for the entire sync so NOOP
+                    // never fires mid-operation
+                    await this.pool.withClient(async (client) => {
+                        progress.report({ increment: 5, message: 'Scanning remote…' });
+                        const remoteFiles = new Map<string, FtpFileInfo>();
+                        await this.scanRemoteDir(client, config.remotePath, remoteFiles);
+                        this.logger.info(`Remote files: ${remoteFiles.size}`);
 
-                    progress.report({ increment: 5, message: 'Scanning remote…' });
-                    const remoteFiles = new Map<string, FtpFileInfo>();
-                    await this.scanRemoteDir(client, config.remotePath, remoteFiles);
-                    this.logger.info(`Remote files: ${remoteFiles.size}`);
+                        progress.report({ increment: 5, message: 'Scanning local…' });
+                        const localFiles = new Map<string, string>();
+                        this.scanLocalDir(workspacePath, workspaceUri, config.remotePath, config.exclude, localFiles);
+                        this.logger.info(`Local files:  ${localFiles.size}`);
 
-                    progress.report({ increment: 5, message: 'Scanning local…' });
-                    const localFiles = new Map<string, string>(); // remotePath → localAbsPath
-                    this.scanLocalDir(workspacePath, workspaceUri, config.remotePath, config.exclude, localFiles);
-                    this.logger.info(`Local files:  ${localFiles.size}`);
+                        const total = localFiles.size + remoteFiles.size;
+                        let processed = 0;
 
-                    const total = localFiles.size + remoteFiles.size;
-                    let processed = 0;
+                        // ── Upload local → remote ─────────────────────────────
+                        for (const [remotePath, localAbsPath] of localFiles) {
+                            processed++;
+                            progress.report({
+                                message: `${processed}/${total}: ${path.basename(localAbsPath)}`,
+                                increment: Math.round(85 / Math.max(total, 1)),
+                            });
 
-                    // ── Upload local → remote ──────────────────────────────
-                    for (const [remotePath, localAbsPath] of localFiles) {
-                        processed++;
-                        progress.report({
-                            message: `${processed}/${total}: ${path.basename(localAbsPath)}`,
-                            increment: Math.round(85 / Math.max(total, 1)),
-                        });
+                            const remoteInfo = remoteFiles.get(remotePath);
 
-                        const remoteInfo = remoteFiles.get(remotePath);
-
-                        if (!remoteInfo) {
-                            // Remote doesn't have it → upload
-                            try {
-                                await client.ensureDir(remoteDir(remotePath));
-                                await client.uploadFile(localAbsPath, remotePath);
-                                stats.uploaded++;
-                                this.logger.info(`↑ New:    ${remotePath}`);
-                            } catch (err: unknown) {
-                                stats.failed++;
-                                this.logger.error(`↑ Failed: ${remotePath}: ${(err as Error).message}`);
-                            }
-                        } else {
-                            const localMtime = fs.statSync(localAbsPath).mtimeMs;
-                            const remoteMtime = remoteInfo.modifiedAt?.getTime() ?? 0;
-
-                            if (localMtime > remoteMtime + 2000) {
+                            if (!remoteInfo) {
                                 try {
                                     await client.ensureDir(remoteDir(remotePath));
                                     await client.uploadFile(localAbsPath, remotePath);
                                     stats.uploaded++;
-                                    this.logger.info(`↑ Newer: ${remotePath}`);
+                                    this.logger.info(`↑ New:    ${remotePath}`);
                                 } catch (err: unknown) {
                                     stats.failed++;
                                     this.logger.error(`↑ Failed: ${remotePath}: ${(err as Error).message}`);
                                 }
                             } else {
-                                stats.skipped++;
-                                this.logger.debug(`= In sync: ${remotePath}`);
+                                const localMtime = fs.statSync(localAbsPath).mtimeMs;
+                                const remoteMtime = remoteInfo.modifiedAt?.getTime() ?? 0;
+
+                                if (localMtime > remoteMtime + 2000) {
+                                    try {
+                                        await client.ensureDir(remoteDir(remotePath));
+                                        await client.uploadFile(localAbsPath, remotePath);
+                                        stats.uploaded++;
+                                        this.logger.info(`↑ Newer: ${remotePath}`);
+                                    } catch (err: unknown) {
+                                        stats.failed++;
+                                        this.logger.error(`↑ Failed: ${remotePath}: ${(err as Error).message}`);
+                                    }
+                                } else {
+                                    stats.skipped++;
+                                    this.logger.debug(`= In sync: ${remotePath}`);
+                                }
+
+                                remoteFiles.delete(remotePath);
                             }
-
-                            remoteFiles.delete(remotePath); // mark as processed
                         }
-                    }
 
-                    // ── Download remote-only files ──────────────────────────
-                    for (const [remotePath, remoteInfo] of remoteFiles) {
-                        processed++;
-                        progress.report({ message: `↓ ${remoteInfo.name}` });
+                        // ── Download remote-only files ─────────────────────────
+                        for (const [remotePath, remoteInfo] of remoteFiles) {
+                            processed++;
+                            progress.report({ message: `↓ ${remoteInfo.name}` });
 
-                        const localAbsPath = remoteToLocalPath(remotePath, config.remotePath, workspaceUri);
-                        const localDirectory = path.dirname(localAbsPath);
-                        const tempPath = `${localAbsPath}.smartftp_tmp`;
+                            const localAbsPath = remoteToLocalPath(remotePath, config.remotePath, workspaceUri);
+                            const localDirectory = path.dirname(localAbsPath);
+                            const tempPath = `${localAbsPath}.smartftp_tmp`;
 
-                        try {
-                            if (!fs.existsSync(localDirectory)) {
-                                fs.mkdirSync(localDirectory, { recursive: true });
+                            try {
+                                if (!fs.existsSync(localDirectory)) {
+                                    fs.mkdirSync(localDirectory, { recursive: true });
+                                }
+                                await client.downloadFile(remotePath, tempPath);
+                                fs.renameSync(tempPath, localAbsPath);
+                                stats.downloaded++;
+                                this.logger.info(`↓ Remote-only: ${remotePath}`);
+                            } catch (err: unknown) {
+                                if (fs.existsSync(tempPath)) { fs.unlinkSync(tempPath); }
+                                stats.failed++;
+                                this.logger.error(`↓ Failed: ${remotePath}: ${(err as Error).message}`);
                             }
-                            await client.downloadFile(remotePath, tempPath);
-                            fs.renameSync(tempPath, localAbsPath);
-                            stats.downloaded++;
-                            this.logger.info(`↓ Remote-only: ${remotePath}`);
-                        } catch (err: unknown) {
-                            if (fs.existsSync(tempPath)) { fs.unlinkSync(tempPath); }
-                            stats.failed++;
-                            this.logger.error(`↓ Failed: ${remotePath}: ${(err as Error).message}`);
                         }
-                    }
+                    });
 
                     const summary = `↑ ${stats.uploaded} uploaded, ↓ ${stats.downloaded} downloaded, = ${stats.skipped} in sync, ✗ ${stats.failed} failed.`;
                     this.logger.info(`Sync complete — ${summary}`);

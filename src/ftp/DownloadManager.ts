@@ -57,16 +57,17 @@ export class DownloadManager {
                 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                     const tempPath = `${localPath}.smartftp_tmp`;
                     try {
-                        const client = await this.pool.acquire();
-                        progress.report({ increment: 30, message: 'Downloading…' });
+                        await this.pool.withClient(async (client) => {
+                            progress.report({ increment: 30, message: 'Downloading…' });
 
-                        const localDir = path.dirname(localPath);
-                        if (!fs.existsSync(localDir)) {
-                            fs.mkdirSync(localDir, { recursive: true });
-                        }
+                            const localDir = path.dirname(localPath);
+                            if (!fs.existsSync(localDir)) {
+                                fs.mkdirSync(localDir, { recursive: true });
+                            }
 
-                        await client.downloadFile(remotePath, tempPath);
-                        fs.renameSync(tempPath, localPath);
+                            await client.downloadFile(remotePath, tempPath);
+                            fs.renameSync(tempPath, localPath);
+                        });
 
                         progress.report({ increment: 100, message: 'Done!' });
                         this.logger.info(`✓ Download successful: ${fileName}`);

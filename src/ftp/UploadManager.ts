@@ -98,21 +98,21 @@ export class UploadManager {
 
                 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                     try {
-                        const client = await this.pool.acquire();
+                        await this.pool.withClient(async (client) => {
+                            progress.report({ increment: 20, message: 'Uploading…' });
 
-                        progress.report({ increment: 20, message: 'Uploading…' });
+                            const stat = fs.statSync(localPath);
+                            client.trackProgress((info) => {
+                                if (stat.size > 0) {
+                                    const pct = Math.min(80, Math.round((info.bytes / stat.size) * 80));
+                                    progress.report({ increment: pct, message: `${formatBytes(info.bytes)} / ${formatBytes(stat.size)}` });
+                                }
+                            });
 
-                        const stat = fs.statSync(localPath);
-                        client.trackProgress((info) => {
-                            if (stat.size > 0) {
-                                const pct = Math.min(80, Math.round((info.bytes / stat.size) * 80));
-                                progress.report({ increment: pct, message: `${formatBytes(info.bytes)} / ${formatBytes(stat.size)}` });
-                            }
+                            await client.ensureDir(remoteDirectory);
+                            await client.uploadFile(localPath, remotePath);
+                            client.trackProgress();
                         });
-
-                        await client.ensureDir(remoteDirectory);
-                        await client.uploadFile(localPath, remotePath);
-                        client.trackProgress(); // stop tracking
 
                         progress.report({ increment: 100, message: 'Done!' });
                         this.logger.info(`✓ Upload successful: ${fileName}`);
@@ -180,40 +180,30 @@ export class UploadManager {
                 let failed = 0;
 
                 try {
-                    // Acquire once — reuse for all files
-                    const client = await this.pool.acquire();
+                    // Acquire once — reuse for all files within the busy-lock
+                    await this.pool.withClient(async (client) => {
+                        for (const localFilePath of files) {
+                            const fileUri = vscode.Uri.file(localFilePath);
+                            const remotePath = localToRemotePath(fileUri, workspaceUri, config.remotePath);
+                            const fileName = path.basename(localFilePath);
 
-                    for (const localFilePath of files) {
-                        const fileUri = vscode.Uri.file(localFilePath);
-                        const remotePath = localToRemotePath(fileUri, workspaceUri, config.remotePath);
-                        const fileName = path.basename(localFilePath);
+                            progress.report({
+                                message: `${uploaded + failed + 1}/${files.length}: ${fileName}`,
+                                increment: Math.round(100 / files.length),
+                            });
 
-                        progress.report({
-                            message: `${uploaded + failed + 1}/${files.length}: ${fileName}`,
-                            increment: Math.round(100 / files.length),
-                        });
-
-                        try {
-                            await client.ensureDir(remoteDir(remotePath));
-                            await client.uploadFile(localFilePath, remotePath);
-                            uploaded++;
-                            this.logger.info(`✓ ${remotePath}`);
-                        } catch (err: unknown) {
-                            failed++;
-                            const msg = err instanceof Error ? err.message : String(err);
-                            this.logger.error(`✗ ${remotePath}: ${msg}`);
-
-                            if (!client.isConnected) {
-                                this.pool.invalidate();
-                                try {
-                                    await this.pool.acquire();
-                                } catch {
-                                    this.logger.error('Reconnection failed — aborting workspace upload.');
-                                    break;
-                                }
+                            try {
+                                await client.ensureDir(remoteDir(remotePath));
+                                await client.uploadFile(localFilePath, remotePath);
+                                uploaded++;
+                                this.logger.info(`✓ ${remotePath}`);
+                            } catch (err: unknown) {
+                                failed++;
+                                const msg = err instanceof Error ? err.message : String(err);
+                                this.logger.error(`✗ ${remotePath}: ${msg}`);
                             }
                         }
-                    }
+                    });
                 } catch (err: unknown) {
                     const msg = err instanceof Error ? err.message : String(err);
                     this.logger.error(`Workspace upload aborted: ${msg}`, err);
